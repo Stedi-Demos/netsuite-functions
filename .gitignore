@@ -1,0 +1,9 @@
+.env
+.env.prod
+.env.staging
+.env.dev
+node_modules
+dist
+assets/netsuite
+
+.DS_Store
