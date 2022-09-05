@@ -2,8 +2,6 @@
 
 This repo contains a single reference function that demonstrates polling NetSuite Purchase Orders summaries using Stedi Functions and persiting them in Stash.
 
-Each function execution is tracked using Stedi Buckets, and an example script has been created to help retry failed executions.
-
 [Axiom.co](https://axiom.co) is also used as a logging and metrics provider for the workload.
 
 ## Managing environments within Stedi
