@@ -23,7 +23,7 @@ cp .env.sample .env
 
 4. Using the Stedi Dashboard create a new [Stash Keyspace](https://www.stedi.com/app/stash) to store the received NetSuite data, set the name field to `netsuite-data` (or similar), then record this keyspace name in our `.env` file using the `NS_PO_STASH_KEYSPACE` variable.
 
-5. Using the Stedi Dashboard create a new [Bucket](https://www.stedi.com/app/buckets) to store your function execution payloads. Set the bucket name in the `EXECUTIONS_BUCKET_NAME` variable in our `.env` file.
+5. Using the Stedi Dashboard create a new [Bucket](https://www.stedi.com/app/buckets) to store your function code. Set the bucket name in the `EXECUTIONS_BUCKET_NAME` variable in our `.env` file.
 
 6. You will require a set of OAUTH tokens to access your NetSuite REST API, these credentials should be stored in our `.env` file using the following names:
 
