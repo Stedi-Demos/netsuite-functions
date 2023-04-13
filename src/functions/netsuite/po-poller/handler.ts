@@ -1,174 +1,167 @@
 import * as dotenv from "dotenv";
 dotenv.config({ override: true });
-import { info } from "../../../shared/axiom.js";
-import { formatInTimeZone, toDate } from "date-fns-tz/esm";
 import { fetchWithRetry } from "../../../shared/fetch-with-retry.js";
-import crypto from "crypto";
-import {
-  StashClient,
-  GetValueCommand,
-  SetValueCommand,
-} from "@stedi/sdk-client-stash";
+import { GetValueCommand, SetValueCommand } from "@stedi/sdk-client-stash";
 import { netSuiteConfig } from "../../../shared/netsuite/config.js";
-import {
-  markExecutionAsFailed,
-  recordNewExecution,
-} from "../../../shared/execution.js";
-import { serializeError } from "serialize-error";
+import { NetSuitePurchaseOrderSummary } from "./types.js";
+import { requiredEnvVar } from "../../../shared/environment.js";
+import { stashClient } from "../../../shared/clients/stash.js";
 
-const stashClient = new StashClient({
-  region: "us",
-  apiKey: process.env["STEDI_API_KEY"],
-});
-
+const stash = stashClient();
 const { client: nsClient, baseURL: nsBaseURL } = netSuiteConfig();
 
-export const handler = async (event: any) => {
-  let executionId: string;
-  try {
-    executionId = await recordNewExecution(event);
-    await info("starting", { input: event, executionId });
+export const RECORD_LIMIT = 10;
+const stashItemKey = (item: { po_id: string }) =>
+  `purchase-order/${item.po_id}/poller`;
 
-    let { value: lastModifiedFrom } = await stashClient.send(
+const keyspaceName = requiredEnvVar("NS_PO_STASH_KEYSPACE");
+const entityIdsIgnoreList = [2, 15];
+
+export const handler = async (event: any) => {
+  const skipped: unknown[] = [];
+  const tracked: unknown[] = [];
+  const ignored: unknown[] = [];
+
+  const { value: lastModifiedFrom } = await stash.send(
+    new GetValueCommand({
+      key: "po-poller-last-run",
+      keyspaceName,
+    })
+  );
+
+  // prepare URL
+  const url = `${nsBaseURL}/query/v1/suiteql?limit=${RECORD_LIMIT}`;
+
+  // prepare headers (oauth yay!)
+  const { authHeader } = nsClient.generateOAuth("POST", url);
+
+  // prepare SuiteQL query
+  const q =
+    `SELECT ` +
+    `  TO_CHAR(Transaction.LastModifiedDate, 'YYYY-MM-DD HH24:MI:SS') po_last_modified_date, ` +
+    `  SESSIONTIMEZONE session_tz, ` +
+    `  Transaction.ID po_id, ` +
+    `  Transaction.TranID po_tran_id, ` +
+    `  Transaction.Status po_status, ` +
+    `  TransactionLine.createdFrom po_created_from_id, ` +
+    `  BUILTIN.DF(TransactionLine.createdFrom) po_created_from_name, ` +
+    `  Transaction.Entity po_entity_id, ` +
+    `  BUILTIN.DF(Transaction.Entity) po_entity_name ` +
+    `FROM Transaction  ` +
+    `  INNER JOIN TransactionLine ON Transaction.ID = TransactionLine.Transaction ` +
+    `WHERE ` +
+    ` Transaction.Type = 'PurchOrd' ` +
+    ` AND TransactionLine.mainline = 'T' ` +
+    ` AND Transaction.LastModifiedDate >= TO_DATE('${lastModifiedFrom}', 'YYYY-MM-DD HH24:MI:SS') ` +
+    ` AND Transaction.Status = 'B'` +
+    ` AND Transaction.custbody_rt_pos_require_approval = 'F'` +
+    ` AND Transaction.custbody_thi_block_po_transmission = 'F' ` +
+    `ORDER BY 1 ASC`;
+
+  const queryRequest = await fetchWithRetry(url, {
+    method: "POST",
+    body: JSON.stringify({ q }),
+    headers: {
+      Authorization: authHeader,
+      Prefer: "transient",
+    },
+    retries: 10,
+    retryOn: [401, 419, 429, 500, 502, 503, 504],
+  });
+
+  const { items } = (await queryRequest.json()) as {
+    items: NetSuitePurchaseOrderSummary[];
+  };
+
+  if (items === undefined || items.length === 0) {
+    const result = {
+      message: "No items returned by query",
+      skipped,
+      tracked,
+      ignored,
+    };
+
+    return result;
+  }
+
+  let maxLastModifiedDate = lastModifiedFrom.toString();
+
+  // for each PO summary
+  for (const item of items) {
+    maxLastModifiedDate = item.po_last_modified_date;
+
+    const itemLog = {
+      productionPOInternalId: item.po_id,
+      entityId: item.po_entity_id,
+      lastModifiedAt: item.po_last_modified_date,
+    };
+
+    // check if we've seen this PO before
+    const existingSummary = await stash.send(
       new GetValueCommand({
-        key: "po-poller-last-run",
-        keyspaceName: process.env["NS_PO_STASH_KEYSPACE"],
+        key: stashItemKey(item),
+        keyspaceName,
       })
     );
-    console.log("start", lastModifiedFrom);
-    lastModifiedFrom =
-      lastModifiedFrom === undefined
-        ? "2022-08-01 01:00:00-04:00"
-        : lastModifiedFrom;
 
-    // prepare URL
-    const recordLimit = 10;
-    const url = `${nsBaseURL}/query/v1/suiteql?limit=${recordLimit}`;
-
-    // prepare headers (oauth yay!)
-    const { authHeader } = nsClient.generateOAuth("POST", url);
-
-    // prepare SuiteQL query
-    const q =
-      `SELECT ` +
-      `  Transaction.LastModifiedDate, ` +
-      `  TO_CHAR(Transaction.LastModifiedDate, 'YYYY-MM-DD HH24:MI:SSTZH:TZM') txn_last_modified_date, ` +
-      `  SESSIONTIMEZONE session_tz, ` +
-      `  Transaction.ID txn_id, ` +
-      `  Transaction.TranID txn_tran_id, ` +
-      `  Transaction.Status txn_status, ` +
-      `  TransactionLine.createdFrom tl_created_from, ` +
-      `  BUILTIN.DF(TransactionLine.createdFrom) tl_created_from_name, ` +
-      `  Transaction.Entity txn_entity, ` +
-      `  BUILTIN.DF(Transaction.Entity) txn_entity_name ` +
-      `FROM Transaction  ` +
-      `  INNER JOIN TransactionLine ON Transaction.ID = TransactionLine.Transaction ` +
-      `WHERE ` +
-      ` Transaction.Type = 'PurchOrd' ` +
-      ` AND TransactionLine.mainline = 'T' ` +
-      ` AND Transaction.LastModifiedDate >= TO_TIMESTAMP_TZ('${lastModifiedFrom}', 'YYYY-MM-DD HH24:MI:SSTZH:TZM' ) ` +
-      ` AND Transaction.Status = 'B' ` +
-      `ORDER BY 1 ASC`;
-
-    const queryRequest = await fetchWithRetry(url, {
-      method: "POST",
-      body: JSON.stringify({ q }),
-      headers: {
-        Authorization: authHeader,
-        Prefer: "transient",
-        "X-NetSuite-Idempotency-Key": crypto.randomUUID(),
-      },
-    });
-
-    const { count, items, hasMore, totalResults, offset } =
-      (await queryRequest.json()) as any;
-    console.log({ count, hasMore, totalResults, offset });
-
-    // console.log(JSON.stringify(items, null, 2));
-    if (items.length === 0) return [];
-
-    let maxLastModfiedDate = toDate(lastModifiedFrom.toString());
-
-    const found = [];
-
-    for (const item of items) {
-      const setPOSummaryRequest = stashClient.send(
-        new SetValueCommand({
-          key: `purchase-order/${item.txn_id}`,
-          keyspaceName: process.env["NS_PO_STASH_KEYSPACE"],
-          value: JSON.stringify({
-            item,
-          }),
-        })
-      );
-
-      found.push(item.txn_tran_id);
-
-      const itemLastModfiedDate = toDate(item.txn_last_modified_date, {
-        timeZone: item.session_tz,
-      });
-
-      if (itemLastModfiedDate < maxLastModfiedDate)
-        throw new Error(
-          "Item's lastModifiedDate should never be less than maxLastModfiedDate"
-        );
-
-      maxLastModfiedDate = itemLastModfiedDate;
-
-      const setLastModifiedRequest = stashClient.send(
-        new SetValueCommand({
-          key: `po-poller-last-run`,
-          keyspaceName: process.env["NS_PO_STASH_KEYSPACE"],
-          value: formatInTimeZone(
-            maxLastModfiedDate,
-            "UTC",
-            "yyyy-MM-dd HH:mm:ssXXX"
-          ),
-        })
-      );
-
-      const results = await Promise.allSettled([
-        setPOSummaryRequest,
-        setLastModifiedRequest,
-      ]);
-
-      if (results.some((result) => result.status === "rejected")) {
-        console.error(results);
-        throw new Error("One or more Stash#setValue requests failed");
-      }
+    // skip if we have seen before
+    if (existingSummary.value !== undefined) {
+      skipped.push(itemLog);
+      await updateHighWaterMark(item, "skipped");
+      continue;
     }
 
-    await info("complete", {
-      payload: formatInTimeZone(
-        maxLastModfiedDate,
-        "UTC",
-        "yyyy-MM-dd HH:mm:ssXXX"
-      ),
-      executionId,
-    });
+    // ignore if in ignore list
+    const ignoredVendor = entityIdsIgnoreList.includes(
+      parseInt(item.po_entity_id)
+    );
+    if (ignoredVendor) {
+      ignored.push(itemLog);
+      await updateHighWaterMark(item, "ignored");
+      continue;
+    }
 
-    return {
-      found,
-      maxLastModfiedDate: formatInTimeZone(
-        maxLastModfiedDate,
-        "UTC",
-        "yyyy-MM-dd HH:mm:ssXXX"
-      ),
-    };
-  } catch (error) {
-    const rawError = serializeError(error);
+    tracked.push(itemLog);
+    await updateHighWaterMark(item, "tracked");
 
-    await Promise.allSettled([
-      markExecutionAsFailed(executionId, rawError),
-      info("exception", {
-        executionId,
-        input: JSON.stringify(event),
-        // @ts-ignore
-        errorMessage: error.message,
-        exception: JSON.stringify(rawError),
-      }),
-    ]);
-
-    return { message: "exception", error: rawError };
+    // Do something with the PO if its "tracked" - we've not seen it before
   }
+
+  const result = {
+    skipped,
+    tracked,
+    ignored,
+    lastModifiedFrom: {
+      start: lastModifiedFrom,
+      final: maxLastModifiedDate,
+    },
+  };
+  return result;
+};
+
+const updateHighWaterMark = async (
+  item: NetSuitePurchaseOrderSummary,
+  action: "skipped" | "tracked" | "ignored"
+) => {
+  // only persist the summary record if we're not skipping,
+  // as skipped will already be persisted from previous run
+  if (action !== "skipped")
+    await stash.send(
+      new SetValueCommand({
+        key: stashItemKey(item),
+        keyspaceName,
+        value: {
+          ...item,
+          action,
+        },
+      })
+    );
+
+  await stash.send(
+    new SetValueCommand({
+      key: `po-poller-last-run`,
+      keyspaceName,
+      value: item.po_last_modified_date,
+    })
+  );
 };
