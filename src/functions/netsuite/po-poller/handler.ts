@@ -54,8 +54,6 @@ export const handler = async (event: any) => {
     ` AND TransactionLine.mainline = 'T' ` +
     ` AND Transaction.LastModifiedDate >= TO_DATE('${lastModifiedFrom}', 'YYYY-MM-DD HH24:MI:SS') ` +
     ` AND Transaction.Status = 'B'` +
-    ` AND Transaction.custbody_rt_pos_require_approval = 'F'` +
-    ` AND Transaction.custbody_thi_block_po_transmission = 'F' ` +
     `ORDER BY 1 ASC`;
 
   const queryRequest = await fetchWithRetry(url, {

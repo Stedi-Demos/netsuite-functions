@@ -2,16 +2,14 @@ import { fetchWithRetry } from "../../../shared/fetch-with-retry.js";
 import { netSuiteConfig } from "../../../shared/netsuite/config.js";
 import { SalesOrderSchema } from "./sales-order-schema.js";
 
-
 const { client: nsClient, baseURL: nsBaseURL } = netSuiteConfig();
 
 export const handler = async (event: any) => {
   // parse event
   const salesOrder = SalesOrderSchema.parse(event);
 
-
-  // remove zero value from rates, to allow recalculation
- for (const item of salesOrder.item.items) {
+  // remove negative rates, to allow recalculation
+  for (const item of salesOrder.item.items) {
     if (item.rate < 0) delete item.rate;
   }
 
@@ -24,7 +22,7 @@ export const handler = async (event: any) => {
     body: JSON.stringify(salesOrder),
     headers: {
       "Content-Type": "application/json",
-      Authorization: authHeader
+      Authorization: authHeader,
     },
   });
 
