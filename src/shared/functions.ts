@@ -1,80 +1,78 @@
+import { DocumentType } from "@aws-sdk/types";
+import { PutObjectCommand } from "@stedi/sdk-client-buckets";
 import {
   CreateFunctionCommand,
   CreateFunctionCommandOutput,
   DeleteFunctionCommand,
   DeleteFunctionCommandOutput,
-  FunctionsClient,
-  FunctionsClientConfig,
+  InvocationType,
   InvokeFunctionCommand,
   UpdateFunctionCommand,
   UpdateFunctionCommandOutput,
 } from "@stedi/sdk-client-functions";
-import { NodeHttpHandler } from "@aws-sdk/node-http-handler";
-import { TextDecoder, TextEncoder } from "util";
+import { bucketsClient } from "./clients/buckets.js";
+import { functionsClient } from "./clients/functions.js";
+import { requiredEnvVar } from "./environment.js";
+import {
+  CreateEventToFunctionBindingCommand,
+  UpdateEventToFunctionBindingCommand,
+} from "@stedi/sdk-client-events";
+import { eventsClient } from "./clients/events.js";
+import { ErrorWithContext } from "./error-with-context.js";
 
-let _functionCient: FunctionsClient;
-
-export const functionClient = (): FunctionsClient => {
-  if (_functionCient === undefined) {
-    const config: FunctionsClientConfig = {
-      maxAttempts: 5,
-      region: "us-east-1",
-      requestHandler: new NodeHttpHandler({
-        connectionTimeout: 1_000,
-      }),
-    };
-
-    // additional config needed when running function code locally.
-    if (!process.env.LAMBDA_TASK_ROOT) {
-      config.endpoint = `https://functions.cloud.us.stedi.com/2021-11-16`;
-      config.apiKey = process.env.STEDI_API_KEY ?? "";
-    }
-    _functionCient = new FunctionsClient(config);
-  }
-
-  return _functionCient;
-};
+const functions = functionsClient();
+const buckets = bucketsClient();
+const events = eventsClient();
 
 export const invokeFunction = async (
   functionName: string,
-  input: any
-): Promise<any> => {
-  const result = await functionClient().send(
+  input: unknown,
+  invocationType = InvocationType.SYNCHRONOUS
+): Promise<DocumentType | undefined> => {
+  const result = await functions.send(
     new InvokeFunctionCommand({
       functionName,
-      invocationType: "RequestResponse",
-      requestPayload: new TextEncoder().encode(JSON.stringify(input)),
+      payload: input as DocumentType,
+      invocationType,
     })
   );
 
-  return new TextDecoder().decode(result.responsePayload);
-};
+  if (result.error) {
+    throw new ErrorWithContext("function invocation error", {
+      result,
+    });
+  }
 
-export const invokeFunctionAsync = async (
-  functionName: string,
-  input: any
-): Promise<void> => {
-  await functionClient().send(
-    new InvokeFunctionCommand({
-      functionName,
-      invocationType: "Event",
-      requestPayload: new TextEncoder().encode(JSON.stringify(input)),
-    })
-  );
+  return result.payload;
 };
 
 export const createFunction = async (
   functionName: string,
   functionPackage: Uint8Array,
-  environmentVariables?: {
-    [key: string]: string;
-  }
+  environmentVariables?: Record<string, string>
 ): Promise<CreateFunctionCommandOutput> => {
-  return functionClient().send(
+  const bucketName = requiredEnvVar("EXECUTIONS_BUCKET_NAME");
+  const key = `functionPackages/${functionName}/${new Date()
+    .getTime()
+    .toString()}-package.zip`;
+
+  await buckets.send(
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
+    new PutObjectCommand({
+      bucketName,
+      key,
+      body: functionPackage,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    }) as any //SDK mismatches
+  );
+
+  return functions.send(
     new CreateFunctionCommand({
       functionName,
-      package: functionPackage,
+      packageBucket: bucketName,
+      packageKey: key,
       environmentVariables,
+
       timeout: 900,
     })
   );
@@ -83,14 +81,28 @@ export const createFunction = async (
 export const updateFunction = async (
   functionName: string,
   functionPackage: Uint8Array,
-  environmentVariables?: {
-    [key: string]: string;
-  }
+  environmentVariables?: Record<string, string>
 ): Promise<UpdateFunctionCommandOutput> => {
-  return functionClient().send(
+  const bucketName = requiredEnvVar("EXECUTIONS_BUCKET_NAME");
+  const key = `functionPackages/${functionName}/${new Date()
+    .getTime()
+    .toString()}-package.zip`;
+
+  await buckets.send(
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
+    new PutObjectCommand({
+      bucketName,
+      key,
+      body: functionPackage,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    }) as any //SDK mismatches
+  );
+
+  return functions.send(
     new UpdateFunctionCommand({
       functionName,
-      package: functionPackage,
+      packageBucket: bucketName,
+      packageKey: key,
       environmentVariables,
       timeout: 900,
     })
@@ -100,9 +112,37 @@ export const updateFunction = async (
 export const deleteFunction = async (
   functionName: string
 ): Promise<DeleteFunctionCommandOutput> => {
-  return functionClient().send(
+  return functions.send(
     new DeleteFunctionCommand({
       functionName,
+    })
+  );
+};
+
+export const createFunctionEventBinding = async (
+  functionName: string,
+  eventPattern: DocumentType,
+  eventToFunctionBindingName: string
+) => {
+  return events.send(
+    new CreateEventToFunctionBindingCommand({
+      eventPattern,
+      functionName,
+      eventToFunctionBindingName,
+    })
+  );
+};
+
+export const updateFunctionEventBinding = async (
+  functionName: string,
+  eventPattern: DocumentType,
+  eventToFunctionBindingName: string
+) => {
+  return events.send(
+    new UpdateEventToFunctionBindingCommand({
+      eventPattern,
+      functionName,
+      eventToFunctionBindingName,
     })
   );
 };
